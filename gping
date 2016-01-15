@@ -1,0 +1,261 @@
+#!/usr/bin/env ruby -w
+
+require 'json'
+require 'optparse'
+
+# Represents a single host.
+
+class Host
+  @states = {
+    awake:   '🙂',
+    asleep:  '💤',
+    lurking: '🌚',
+    free:    '🆓'
+  }
+
+  class << self
+    attr_reader :states
+  end
+
+  attr_reader :ip, :alive
+
+  def initialize(ip, alive = nil, name = nil)
+    @ip, @alive, @name = [ip, alive, name]
+  end
+
+  def states
+    self.class.states
+  end
+
+  # Return which of the four possible states the Host is in.
+  def state
+    if @name
+      @alive ? :awake : :asleep
+    else
+      @alive ? :lurking : :free
+    end
+  end
+
+  # Return a possibly-shortened form of the Host's name, or nil if it has
+  # none.
+  def name(basename = false)
+    @name && basename ? @name.split('.').first : @name
+  end
+
+  def report(options)
+    # The two spaces after the state are deliberate, because the Emoji are
+    # double-width and therefore, on the terminal, eat up the character after
+    # them.
+    printf("%-16s: %s  : %s\n",
+           @ip, states[state], name(options[:basename]))
+  end
+
+end
+
+# Represents a group of hosts.
+
+class HostSet
+
+  def initialize(range, begun, ended, hosts)
+    @range = range
+    @begun = begun
+    @ended = ended
+    @hosts = hosts
+  end
+
+  def self.fping(addrs)
+    host_re = /^(?<name>\S+) \((?<address>[\d.]+)\) is (?<state>\S+)$/
+
+    range = addrs.join(' ')
+
+    begun = Time.now
+    stats = %x(fping -A -d -r 1 -g #{range} | sort -V -k 2)
+    lines = stats.split("\n")
+    hosts = lines.map do |line|
+      match = host_re.match(line)
+      address = match[:address]
+      alive = match[:state].eql?('alive')
+      name = (match[:name].eql?(address) ? nil : match[:name])
+      Host.new(address, alive, name)
+    end
+    hosts.uniq! { |host| host.ip }
+    ended = Time.now
+    self.new(range, begun, ended, hosts)
+  end
+
+  # Load previously-stashed scanning results.
+
+  def self.load(filename)
+    hash = JSON.parse(File.read(filename))
+    new(hash['range'],
+        hash['begun'],
+        hash['ended'],
+        hash['hosts'].map { |ip, results| Host.new(ip, *results) })
+  end
+
+  # Reporting, in various flavors.
+
+  # This method engages in some egregiously tweaky formatting, in an effort to
+  # produce JSON that is simultaneously concise and human-friendly. I will
+  # probably either regret or be punished for this. Possibly both.
+  def jsonify
+    puts "{"
+    %w[range begun ended].each do |var|
+      puts %Q(  "#{var}": "#{instance_variable_get("@#{var}")}",)
+    end
+
+    puts '  "hosts": {'
+
+    @hosts.each_with_index do |host, i|
+      puts ',' unless i.zero?
+      components = [
+        %Q("#{host.ip}"), "#{host.alive},",
+        host.name ? %Q("#{host.name}") : 'null'
+      ]
+      printf %Q(    %-17s : [%-6s %s]) % components
+    end
+    puts "\n  }\n}"
+  end
+
+  def get_states(specified)
+    specified.empty? ? Host.states.keys : specified
+  end
+
+  def group_hosts(group_set)
+    states = get_states(group_set)
+    grouping = Hash.new { |hash, key| hash[key] = [] }
+
+    @hosts.each do |host|
+      grouping[host.state] << host
+    end
+
+    grouping.values_at(*states).flatten
+  end
+
+  def report(options = {})
+    if options[:json]
+      jsonify
+    else
+      group_set = options[:group]
+      host_set = ( group_set ? group_hosts(group_set) : @hosts )
+      host_set.each { |host| host.report(options) }
+    end
+  end
+
+end
+
+
+# --------
+
+# Options:
+#
+#   Load from a file.
+#   IP or range of IPs (can be combined with load).
+#
+#   Save to a file.
+#   Show host basename only
+#   Report (sorted by address?).
+#   Grouped report.
+#   Group, but only display selected groups.
+#
+#   Force Probe
+#   Suppress Probe (?)
+
+# Probing:
+# If a host's pingability is non-nil, it will not be pinged again unless this is forced.
+
+# Hosts whose "alive" is nil are pinged.
+
+
+def parse_options
+  options = {}
+
+  op = OptionParser.new do |opts|
+    opts.banner = "Usage: #{opts.program_name} [option]..."
+
+    opts.on("-h", "--help", "Show help") do
+
+    end
+
+    opts.on("-b", "--basename", 'Use basenames rather than FQDNs.') do
+      options[:basename] = true
+    end
+
+    opts.on("-j", "--json", 'Emit results as JSON.') do |file|
+      options[:json] = true
+    end
+
+    opts.on("-l", "--load FILE", 'Load from FILE.') do |file|
+      options[:load] = file
+    end
+
+    # Support an optional list of groups; default to all if empty.
+
+    opts.on("-g", "--group[=STATES]", 'Group.') do |states|
+      options[:group] ||= []
+      if states
+        syms = states.split(',').map(&:to_sym)
+        options[:group] = options[:group].concat(syms).uniq
+      end
+    end
+
+  end
+
+  op.parse!
+
+  # Post-parse: check that, if the user has explicitly specificed states to
+  # group by, the states in question are actually known.
+
+  syms = options[:group]
+  validate_groups(syms)
+
+  options
+end
+
+
+# Check that the groups requested for output are valid.
+
+def validate_groups(syms)
+  if syms && !syms.empty?
+    valid = Host.states.keys
+    invalid = syms - valid
+    unless invalid.empty?
+      list = proc { |l| l.map { |s| "'#{s}'"}.join(', ') }
+      message = "Unknown state%s: %s.\n" % [(invalid.length > 1 ? 's' : ''),
+                                     list.call(invalid) ]
+      message << "Valid states: %s.\n" % list.call(valid)
+      abort(message)
+    end
+  end
+end
+
+
+# Check to ensure that the external binaries we depend upon are available.
+
+def ensure_binaries(binaries)
+  missing = []
+  binaries.each do |binary|
+    missing << binary unless system("which -s #{binary}")
+  end
+  unless missing.empty?
+    puts "The following required binaries are missing:\n\n"
+    puts missing.map { |i| "  " + i }
+    abort
+  end
+end
+
+# ------------------
+
+ensure_binaries(%w[fping sort])
+
+if ARGV.empty?
+  puts "You must provide an IP range."
+else
+  options = parse_options
+  if options[:load]
+    hosts = HostSet.load(options[:load])
+  else
+    hosts = HostSet.fping(ARGV)
+  end
+  hosts.report(options)
+end
