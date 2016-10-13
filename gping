@@ -1,4 +1,5 @@
-#!/usr/bin/env ruby -w
+#! /usr/bin/env ruby
+# coding: utf-8
 
 require 'json'
 require 'optparse'
@@ -69,7 +70,7 @@ class HostSet
     range = addrs.join(' ')
 
     begun = Time.now
-    stats = %x(fping -A -d -r 1 -g #{range} | sort -V -k 2)
+    stats = %x(fping -A -d -r 1 -g #{range} 2>/dev/null | sort -V -k 2)
     lines = stats.split("\n")
     hosts = lines.map do |line|
       match = host_re.match(line)
@@ -235,7 +236,7 @@ end
 def ensure_binaries(binaries)
   missing = []
   binaries.each do |binary|
-    missing << binary unless system("which -s #{binary}")
+    missing << binary unless system("which #{binary} > /dev/null")
   end
   unless missing.empty?
     puts "The following required binaries are missing:\n\n"
